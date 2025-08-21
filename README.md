@@ -29,6 +29,7 @@ A reverse-engineered asynchronous python wrapper for [Google Gemini](https://gem
 ## Features
 
 - **Persistent Cookies** - Automatically refreshes cookies in background. Optimized for always-on services.
+- **Streaming Response** - Supports real-time streaming content generation similar to OpenAI's API for immediate response processing.
 - **Image Generation** - Natively supports generating and modifying images with natural language.
 - **System Prompt** - Supports customizing model's system prompt with [Gemini Gems](https://gemini.google.com/gems/view).
 - **Extension Support** - Supports generating contents with [Gemini extensions](https://gemini.google.com/extensions) on, like YouTube and Gmail.
@@ -45,6 +46,7 @@ A reverse-engineered asynchronous python wrapper for [Google Gemini](https://gem
 - [Usage](#usage)
   - [Initialization](#initialization)
   - [Generate contents](#generate-contents)
+  - [Generate streaming contents](#generate-streaming-contents)
   - [Generate contents with files](#generate-contents-with-files)
   - [Conversations across multiple turns](#conversations-across-multiple-turns)
   - [Continue previous conversations](#continue-previous-conversations)
@@ -150,6 +152,51 @@ asyncio.run(main())
 > [!TIP]
 >
 > Simply use `print(response)` to get the same output if you just want to see the response text
+
+### Generate streaming contents
+
+For real-time content generation, use `GeminiClient.generate_content_stream` which returns an async generator that yields `gemini_webapi.StreamChunk` objects as the response is being generated.
+
+```python
+async def main():
+    # Stream content generation
+    async for chunk in client.generate_content_stream("Tell me a story"):
+        if chunk.delta.text:
+            print(chunk.delta.text, end='', flush=True)
+        if chunk.finish_reason:
+            print(f"\n[Finished: {chunk.finish_reason}]")
+
+asyncio.run(main())
+```
+
+You can also collect the full response from the stream:
+
+```python
+async def main():
+    full_text = ""
+    async for chunk in client.generate_content_stream("What is Python?"):
+        if chunk.delta.text:
+            full_text += chunk.delta.text
+        if chunk.finish_reason:
+            break
+    print(f"Complete response: {full_text}")
+
+asyncio.run(main())
+```
+
+For chat sessions, use `ChatSession.send_message_stream`:
+
+```python
+async def main():
+    chat = client.start_chat()
+    async for chunk in chat.send_message_stream("Hello, how are you?"):
+        if chunk.delta.text:
+            print(chunk.delta.text, end='', flush=True)
+        if chunk.finish_reason:
+            print(f"\n[Finished: {chunk.finish_reason}]")
+
+asyncio.run(main())
+```
 
 ### Generate contents with files
 

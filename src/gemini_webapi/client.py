@@ -2,7 +2,7 @@ import asyncio
 import re
 from asyncio import Task
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, AsyncGenerator
 
 import orjson as json
 from httpx import AsyncClient, ReadTimeout, Response
@@ -26,6 +26,8 @@ from .types import (
     ModelOutput,
     Gem,
     RPCData,
+    StreamChunk,
+    StreamDelta,
 )
 from .utils import (
     upload_file,
@@ -498,6 +500,212 @@ class GeminiClient(GemMixin):
 
             return output
 
+    @running(retry=2)
+    async def generate_content_stream(
+        self,
+        prompt: str,
+        files: list[str | Path] | None = None,
+        model: Model | str = Model.UNSPECIFIED,
+        gem: Gem | str | None = None,
+        chat: Optional["ChatSession"] = None,
+        **kwargs,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """
+        Generates contents with prompt in streaming mode.
+
+        Parameters
+        ----------
+        prompt: `str`
+            Prompt provided by user.
+        files: `list[str | Path]`, optional
+            List of file paths to be attached.
+        model: `Model` | `str`, optional
+            Specify the model to use for generation.
+            Pass either a `gemini_webapi.constants.Model` enum or a model name string.
+        gem: `Gem | str`, optional
+            Specify a gem to use as system prompt for the chat session.
+            Pass either a `gemini_webapi.types.Gem` object or a gem id string.
+        chat: `ChatSession`, optional
+            Chat data to retrieve conversation history. If None, will automatically generate a new chat id when sending post request.
+        kwargs: `dict`, optional
+            Additional arguments which will be passed to the post request.
+            Refer to `httpx.AsyncClient.request` for more information.
+
+        Yields
+        ------
+        :class:`StreamChunk`
+            Streaming chunks containing incremental text updates.
+
+        Raises
+        ------
+        `AssertionError`
+            If prompt is empty.
+        `gemini_webapi.TimeoutError`
+            If request timed out.
+        `gemini_webapi.APIError`
+            - If request failed with status code other than 200.
+            - If response structure is invalid and failed to parse.
+        """
+
+        assert prompt, "Prompt cannot be empty."
+
+        if not isinstance(model, Model):
+            model = Model.from_name(model)
+
+        if isinstance(gem, Gem):
+            gem = gem.id
+
+        if self.auto_close:
+            await self.reset_close_task()
+
+        try:
+            # Prepare the same request as generate_content but stream the response
+            async with self.client.stream(
+                "POST",
+                Endpoint.GENERATE.value,
+                headers=model.model_header,
+                data={
+                    "at": self.access_token,
+                    "f.req": json.dumps(
+                        [
+                            None,
+                            json.dumps(
+                                [
+                                    files
+                                    and [
+                                        prompt,
+                                        0,
+                                        None,
+                                        [
+                                            [
+                                                [await upload_file(file, self.proxy)],
+                                                parse_file_name(file),
+                                            ]
+                                            for file in files
+                                        ],
+                                    ]
+                                    or [prompt],
+                                    None,
+                                    chat and chat.metadata,
+                                ]
+                                + (gem and [None] * 16 + [gem] or [])
+                            ).decode(),
+                        ]
+                    ).decode(),
+                },
+                **kwargs,
+            ) as response:
+                if response.status_code != 200:
+                    await self.close()
+                    raise APIError(
+                        f"Failed to generate contents. Request failed with status code {response.status_code}"
+                    )
+
+                # Parse streaming response
+                buffer = ""
+                previous_text = ""
+                rcid = None
+                
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+                    
+                    # Process complete chunks in the buffer
+                    while True:
+                        # Look for the start of a new chunk (number followed by newline)
+                        lines = buffer.split('\n')
+                        
+                        # Skip the initial ")]}'" line if present
+                        if lines[0] == ')]}\'':
+                            lines = lines[1:]
+                            buffer = '\n'.join(lines)
+                            continue
+                        
+                        if len(lines) < 2:
+                            break
+                            
+                        try:
+                            # Try to parse chunk size
+                            chunk_size = int(lines[0])
+                            
+                            # Check if we have enough data for this chunk
+                            remaining_data = '\n'.join(lines[1:])
+                            if len(remaining_data) < chunk_size:
+                                break
+                                
+                            # Extract the chunk data
+                            chunk_data = remaining_data[:chunk_size]
+                            buffer = remaining_data[chunk_size:].lstrip('\n')
+                            
+                            # Parse the JSON data
+                            try:
+                                chunk_json = json.loads(chunk_data)
+                                if not isinstance(chunk_json, list) or len(chunk_json) == 0:
+                                    continue
+                                    
+                                # Look for text content in the chunk
+                                if (len(chunk_json) >= 3 and 
+                                    isinstance(chunk_json[2], str)):
+                                    
+                                    inner_data = json.loads(chunk_json[2])
+                                    if (isinstance(inner_data, list) and 
+                                        len(inner_data) >= 5 and 
+                                        inner_data[4] and 
+                                        isinstance(inner_data[4], list) and 
+                                        len(inner_data[4]) > 0):
+                                        
+                                        candidate = inner_data[4][0]
+                                        if (isinstance(candidate, list) and 
+                                            len(candidate) >= 2 and 
+                                            isinstance(candidate[1], list) and 
+                                            len(candidate[1]) > 0):
+                                            
+                                            current_text = candidate[1][0]
+                                            if current_text and current_text != previous_text:
+                                                # Extract incremental text
+                                                if current_text.startswith(previous_text):
+                                                    delta_text = current_text[len(previous_text):]
+                                                else:
+                                                    delta_text = current_text
+                                                
+                                                if delta_text:
+                                                    # Get rcid if available
+                                                    if not rcid and len(candidate) > 0:
+                                                        rcid = candidate[0]
+                                                    
+                                                    yield StreamChunk(
+                                                        rcid=rcid,
+                                                        delta=StreamDelta(text=delta_text),
+                                                        finish_reason=None
+                                                    )
+                                                    
+                                                previous_text = current_text
+                                
+                                # Check for completion markers
+                                if len(inner_data) >= 12 and inner_data[11]:
+                                    yield StreamChunk(
+                                        rcid=rcid,
+                                        delta=StreamDelta(text=""),
+                                        finish_reason="stop"
+                                    )
+                                    return
+                                    
+                            except (json.JSONDecodeError, IndexError, TypeError):
+                                # Skip malformed chunks
+                                continue
+                                
+                        except ValueError:
+                            # Not a valid chunk size, skip this line
+                            if '\n' in buffer:
+                                buffer = buffer[buffer.index('\n') + 1:]
+                            else:
+                                break
+
+        except ReadTimeout:
+            raise TimeoutError(
+                "Generate content stream request timed out, please try again. If the problem persists, "
+                "consider setting a higher `timeout` value when initializing GeminiClient."
+            )
+
     def start_chat(self, **kwargs) -> "ChatSession":
         """
         Returns a `ChatSession` object attached to this client.
@@ -680,6 +888,52 @@ class ChatSession:
             chat=self,
             **kwargs,
         )
+
+    async def send_message_stream(
+        self,
+        prompt: str,
+        files: list[str | Path] | None = None,
+        **kwargs,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """
+        Generates contents with prompt in streaming mode.
+        Use as a shortcut for `GeminiClient.generate_content_stream(prompt, image, self)`.
+
+        Parameters
+        ----------
+        prompt: `str`
+            Prompt provided by user.
+        files: `list[str | Path]`, optional
+            List of file paths to be attached.
+        kwargs: `dict`, optional
+            Additional arguments which will be passed to the post request.
+            Refer to `httpx.AsyncClient.request` for more information.
+
+        Yields
+        ------
+        :class:`StreamChunk`
+            Streaming chunks containing incremental text updates.
+
+        Raises
+        ------
+        `AssertionError`
+            If prompt is empty.
+        `gemini_webapi.TimeoutError`
+            If request timed out.
+        `gemini_webapi.APIError`
+            - If request failed with status code other than 200.
+            - If response structure is invalid and failed to parse.
+        """
+
+        async for chunk in self.geminiclient.generate_content_stream(
+            prompt=prompt,
+            files=files,
+            model=self.model,
+            gem=self.gem,
+            chat=self,
+            **kwargs,
+        ):
+            yield chunk
 
     def choose_candidate(self, index: int) -> ModelOutput:
         """
