@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "setuptools_scm>=8"]
+requires = ["setuptools>=60"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -25,7 +25,8 @@ dependencies = [
     "orjson~=3.11.1",
     "pydantic~=2.11.5",
 ]
-dynamic = ["version"]
+dynamic = []
+version = "0.1.0"
 
 [project.urls]
 Repository = "https://github.com/HanaokaYuzu/Gemini-API"
@@ -33,8 +34,6 @@ Issues = "https://github.com/HanaokaYuzu/Gemini-API/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-include = ["gemini_webapi"]
+include = ["gemini_webapi*"]
 
-[tool.setuptools_scm]
-version_scheme = "post-release"
-local_scheme = "no-local-version"
+
