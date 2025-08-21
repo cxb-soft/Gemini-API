@@ -28,8 +28,8 @@ dependencies = [
 dynamic = ["version"]
 
 [project.urls]
-Repository = "https://github.com/HanaokaYuzu/Gemini-API"
-Issues = "https://github.com/HanaokaYuzu/Gemini-API/issues"
+Repository = "https://github.com/cxb-soft/Gemini-API"
+Issues = "https://github.com/cxb-soft/Gemini-API/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
